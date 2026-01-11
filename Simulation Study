@@ -1,0 +1,239 @@
+import numpy as np
+import scipy.stats as st
+from scipy.optimize import minimize
+from scipy.integrate import quad
+import pandas as pd
+
+# --- 1. PERK DISTRIBUTION FUNCTIONS ---
+
+def perk_pdf(x, alpha, gamma):
+    numerator = alpha * gamma * np.exp(gamma * x) * (1 + alpha)
+    denominator = (1 + alpha * np.exp(gamma * x))**2
+    return numerator / denominator
+
+def perk_cdf(x, alpha, gamma):
+    return 1 - ((1 + alpha) / (1 + alpha * np.exp(gamma * x)))
+
+def perk_inv_cdf(u, alpha, gamma):
+    """Inverse CDF for generating random data"""
+    # Derived from u = F(x) -> solve for x
+    # 1 - u = (1+alpha) / (1 + alpha * exp(gamma*x))
+    # 1 + alpha * exp(gamma*x) = (1+alpha)/(1-u)
+    # exp(gamma*x) = [ (1+alpha)/(1-u) - 1 ] / alpha
+    term = ((1 + alpha) / (1 - u) - 1) / alpha
+    return (1 / gamma) * np.log(term)
+
+def true_reliability(s, k, alpha, beta, gamma):
+    """Numerical integration to find true xi_{s,k}"""
+    def integrand(y):
+        fx = perk_cdf(y, alpha, gamma)
+        fy_pdf = perk_pdf(y, beta, gamma)
+        
+        # Binomial summation
+        sum_val = 0
+        for i in range(s, k + 1):
+            binom = st.binom.pmf(i, k, 1 - fx) # Probability that X > Y
+            sum_val += binom
+        
+        return sum_val * fy_pdf
+
+    # Integrate from 0 to Infinity
+    result, _ = quad(integrand, 0, np.inf)
+    return result
+
+# --- 2. DATA GENERATION (ATIPHC) ---
+
+def generate_atiphc_data(n, m, T, alpha, gamma, removal_scheme):
+    """
+    Generates Adaptive Type-I Progressive Hybrid Censored Data
+    """
+    # 1. Generate n i.i.d samples
+    u = np.random.uniform(0, 1, n)
+    lifetimes = perk_inv_cdf(u, alpha, gamma)
+    lifetimes.sort()
+    
+    observed = []
+    R_obs = [] # Observed removals
+    
+    current_n = n
+    failures = 0
+    
+    for i in range(m):
+        t = lifetimes[i]
+        
+        # Check time constraint
+        if t > T:
+            break
+            
+        observed.append(t)
+        failures += 1
+        
+        # Determine removals
+        if i < len(removal_scheme):
+            r = removal_scheme[i]
+        else:
+            r = 0
+            
+        # Ensure we don't remove more than available
+        # Remaining units (excluding current failure)
+        remaining = current_n - 1 
+        
+        if remaining < r:
+            r = remaining
+            
+        R_obs.append(r)
+        current_n -= (1 + r) # 1 failure + r removed
+        
+        if current_n <= 0:
+            break
+            
+    # Calculate R* (remaining units at termination T)
+    # If we didn't reach m failures, or if units remain after m failures
+    R_star = n - len(observed) - sum(R_obs)
+    
+    return np.array(observed), np.array(R_obs), R_star, failures
+
+# --- 3. CLASSICAL ESTIMATION (MLE, LSE, MPSE) ---
+
+def neg_log_likelihood(params, x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y):
+    alpha, beta, gamma = params
+    if alpha <= 0 or beta <= 0 or gamma <= 0:
+        return 1e10
+    
+    # Log-Likelihood for X (Strength)
+    n_x = len(x_data)
+    ll_x = n_x * np.log(alpha) + n_x * np.log(gamma) + np.log(1+alpha) * (n_x + sum(R_x) + R_star_x)
+    ll_x += gamma * np.sum(x_data)
+    ll_x -= np.sum((R_x + 2) * np.log(1 + alpha * np.exp(gamma * x_data)))
+    ll_x -= R_star_x * np.log(1 + alpha * np.exp(gamma * T_x))
+    
+    # Log-Likelihood for Y (Stress)
+    n_y = len(y_data)
+    ll_y = n_y * np.log(beta) + n_y * np.log(gamma) + np.log(1+beta) * (n_y + sum(R_y) + R_star_y)
+    ll_y += gamma * np.sum(y_data)
+    ll_y -= np.sum((R_y + 2) * np.log(1 + beta * np.exp(gamma * y_data)))
+    ll_y -= R_star_y * np.log(1 + beta * np.exp(gamma * T_y))
+    
+    return -(ll_x + ll_y)
+
+# --- 4. BAYESIAN ESTIMATION (MCMC) ---
+
+def weighted_lindley_prior(val, a, b):
+    # Proportional to (1+val) * val^(b-1) * exp(-a*val)
+    if val <= 0: return -np.inf
+    return np.log(1 + val) + (b - 1)*np.log(val) - a*val
+
+def log_posterior(params, x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y):
+    alpha, beta, gamma = params
+    if alpha <= 0 or beta <= 0 or gamma <= 0:
+        return -np.inf
+        
+    # Likelihood
+    ll = -neg_log_likelihood(params, x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y)
+    
+    # Priors (Vague hyperparameters as per paper)
+    prior_alpha = weighted_lindley_prior(alpha, 0.001, 0.001)
+    prior_beta = weighted_lindley_prior(beta, 0.005, 0.005)
+    prior_gamma = weighted_lindley_prior(gamma, 0.009, 0.009)
+    
+    return ll + prior_alpha + prior_beta + prior_gamma
+
+def run_mcmc(x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y, init_params, n_iter=10000):
+    current_params = np.array(init_params)
+    samples = np.zeros((n_iter, 3))
+    
+    current_log_prob = log_posterior(current_params, x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y)
+    
+    # Proposal covariance (tuned)
+    cov = np.diag([0.01, 0.01, 0.01]) 
+    
+    for i in range(n_iter):
+        # Proposal
+        proposal = np.random.multivariate_normal(current_params, cov)
+        
+        if np.any(proposal <= 0):
+            proposed_log_prob = -np.inf
+        else:
+            proposed_log_prob = log_posterior(proposal, x_data, y_data, R_x, R_y, R_star_x, R_star_y, T_x, T_y)
+            
+        # Accept/Reject
+        if np.log(np.random.rand()) < (proposed_log_prob - current_log_prob):
+            current_params = proposal
+            current_log_prob = proposed_log_prob
+            
+        samples[i, :] = current_params
+        
+    return samples
+
+# --- 5. MAIN SIMULATION LOOP ---
+
+def run_simulation_study():
+    # Parameters (Case 1)
+    true_alpha = 0.5
+    true_beta = 1.5
+    true_gamma = 1.0
+    
+    N_sim = 100 # Number of replications (use 10000 for full paper results)
+    
+    # Storage
+    mle_estimates = []
+    bayes_estimates = []
+    
+    # ATIPHC Settings (Example for Strength)
+    N_total = 30
+    m_fail = 24
+    T_termination = 2.0
+    # Simple scheme: remove 0 until end
+    scheme = [0] * m_fail 
+    scheme[-1] = N_total - m_fail
+    
+    print("Starting Monte Carlo Simulation...")
+    
+    for i in range(N_sim):
+        # Generate Data
+        x_obs, R_x, R_star_x, _ = generate_atiphc_data(N_total, m_fail, T_termination, true_alpha, true_gamma, scheme)
+        y_obs, R_y, R_star_y, _ = generate_atiphc_data(N_total, m_fail, T_termination, true_beta, true_gamma, scheme)
+        
+        # 1. MLE
+        init_guess = [0.5, 1.5, 1.0]
+        res = minimize(neg_log_likelihood, init_guess, 
+                       args=(x_obs, y_obs, R_x, R_y, R_star_x, R_star_y, T_termination, T_termination),
+                       method='Nelder-Mead')
+        
+        mle_est = res.x
+        
+        # Calculate Reliability (MLE)
+        rel_mle = true_reliability(2, 3, mle_est[0], mle_est[1], mle_est[2])
+        mle_estimates.append(rel_mle)
+        
+        # 2. Bayesian (MCMC)
+        # Using MLE as starting point
+        chain = run_mcmc(x_obs, y_obs, R_x, R_y, R_star_x, R_star_y, T_termination, T_termination, mle_est, n_iter=2000)
+        
+        # Burn-in removal
+        burned_chain = chain[500:, :]
+        
+        # Calculate reliability for each posterior sample
+        rel_samples = []
+        for row in burned_chain:
+            rel_samples.append(true_reliability(2, 3, row[0], row[1], row[2]))
+            
+        bayes_est = np.mean(rel_samples) # SEL
+        bayes_estimates.append(bayes_est)
+        
+        if i % 10 == 0:
+            print(f"Iteration {i}/{N_sim} complete.")
+
+    # Results
+    true_val = true_reliability(2, 3, true_alpha, true_beta, true_gamma)
+    mse_mle = np.mean((np.array(mle_estimates) - true_val)**2)
+    mse_bayes = np.mean((np.array(bayes_estimates) - true_val)**2)
+    
+    print("-" * 30)
+    print(f"True Reliability (2-out-of-3): {true_val:.4f}")
+    print(f"MLE MSE: {mse_mle:.6f}")
+    print(f"Bayes MSE: {mse_bayes:.6f}")
+    print("-" * 30)
+
+if __name__ == "__main__":
+    run_simulation_study()
